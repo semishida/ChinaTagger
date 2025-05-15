@@ -13,14 +13,20 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
+// Subscriber represents a subscriber with ID and Username.
+type Subscriber struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"` // May be empty if user has no username
+}
+
 // Tag represents a tag with its creator, description, and subscribers.
 type Tag struct {
-	Name        string    `json:"name"`
-	CreatorID   int64     `json:"creator_id"`
-	CreatorName string    `json:"creator_name"`
-	Description string    `json:"description"`
-	Subscribers []int64   `json:"subscribers"`
-	CreatedAt   time.Time `json:"created_at"`
+	Name        string       `json:"name"`
+	CreatorID   int64        `json:"creator_id"`
+	CreatorName string       `json:"creator_name"`
+	Description string       `json:"description"`
+	Subscribers []Subscriber `json:"subscribers"`
+	CreatedAt   time.Time    `json:"created_at"`
 }
 
 // Data holds all tags.
@@ -34,27 +40,79 @@ var (
 	dataFile = "tags.json"
 )
 
-// loadData loads tags from JSON file.
+// loadData loads tags from JSON file and handles migration from old format.
 func loadData() error {
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
 
-	// Load environment variable for bot token
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if token == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN not set")
 	}
+
+	// If file doesn't exist, initialize empty data
 	if _, err := os.Stat(dataFile); os.IsNotExist(err) {
 		data = Data{Tags: []Tag{}}
 		return saveData()
 	}
+
+	// Read file
 	file, err := ioutil.ReadFile(dataFile)
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(file, &data)
+
+	// Try to unmarshal into new format
+	err = json.Unmarshal(file, &data)
+	if err != nil {
+		// If unmarshal fails, try to load old format
+		type OldTag struct {
+			Name        string    `json:"name"`
+			CreatorID   int64     `json:"creator_id"`
+			CreatorName string    `json:"creator_name"`
+			Description string    `json:"description"`
+			Subscribers []int64   `json:"subscribers"`
+			CreatedAt   time.Time `json:"created_at"`
+		}
+		type OldData struct {
+			Tags []OldTag `json:"tags"`
+		}
+
+		var oldData OldData
+		if err := json.Unmarshal(file, &oldData); err != nil {
+			return fmt.Errorf("failed to unmarshal old and new data formats: %v", err)
+		}
+
+		// Convert old format to new format
+		data.Tags = make([]Tag, len(oldData.Tags))
+		for i, oldTag := range oldData.Tags {
+			newSubscribers := make([]Subscriber, len(oldTag.Subscribers))
+			for j, subID := range oldTag.Subscribers {
+				newSubscribers[j] = Subscriber{
+					ID:       subID,
+					Username: fmt.Sprintf("User%d", subID), // Placeholder username
+				}
+			}
+			data.Tags[i] = Tag{
+				Name:        oldTag.Name,
+				CreatorID:   oldTag.CreatorID,
+				CreatorName: oldTag.CreatorName,
+				Description: oldTag.Description,
+				Subscribers: newSubscribers,
+				CreatedAt:   oldTag.CreatedAt,
+			}
+		}
+
+		// Save migrated data
+		if err := saveData(); err != nil {
+			return fmt.Errorf("failed to save migrated data: %v", err)
+		}
+		log.Println("Successfully migrated old data format to new format")
+	}
+
+	return nil
 }
 
 // saveData saves tags to JSON file.
@@ -96,7 +154,6 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 
-	// Load environment variable for bot token
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if token == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN not set")
@@ -171,7 +228,7 @@ func main() {
 			CreatorID:   c.Sender().ID,
 			CreatorName: c.Sender().Username,
 			Description: description,
-			Subscribers: []int64{},
+			Subscribers: []Subscriber{},
 			CreatedAt:   time.Now(),
 		}
 		data.Tags = append(data.Tags, tag)
@@ -195,13 +252,20 @@ func main() {
 
 		// Check if already subscribed
 		for _, sub := range tag.Subscribers {
-			if sub == c.Sender().ID {
+			if sub.ID == c.Sender().ID {
 				return c.Send("Ты уже подписан на этот тег!")
 			}
 		}
 
 		// Subscribe
-		tag.Subscribers = append(tag.Subscribers, c.Sender().ID)
+		username := c.Sender().Username
+		if username == "" {
+			username = fmt.Sprintf("User%d", c.Sender().ID) // Fallback if no username
+		}
+		tag.Subscribers = append(tag.Subscribers, Subscriber{
+			ID:       c.Sender().ID,
+			Username: username,
+		})
 		saveData()
 		return c.Send(fmt.Sprintf("Ты подписался на #%s!", tag.Name))
 	})
@@ -270,7 +334,7 @@ func main() {
 		found := false
 		for _, tag := range data.Tags {
 			for _, sub := range tag.Subscribers {
-				if sub == c.Sender().ID {
+				if sub.ID == c.Sender().ID {
 					response.WriteString(fmt.Sprintf("#%s: %s\n", tag.Name, tag.Description))
 					found = true
 				}
@@ -312,15 +376,20 @@ func main() {
 				tagName := strings.TrimPrefix(word, "#")
 				tag := findTag(tagName)
 				if tag != nil {
+					log.Printf("Found tag: %s", tagName)
+					log.Printf("Tag %s has %d subscribers", tagName, len(tag.Subscribers))
 					for _, sub := range tag.Subscribers {
-						mentions = append(mentions, fmt.Sprintf("@%d", sub))
+						if sub.Username != "" && sub.Username != fmt.Sprintf("User%d", sub.ID) {
+							mentions = append(mentions, fmt.Sprintf("@%s", sub.Username))
+						}
 					}
 				}
 			}
 		}
 
 		if len(mentions) > 0 {
-			return c.Send(strings.Join(mentions, " "))
+			log.Printf("Sending mentions: %v", mentions)
+			return c.Send(strings.Join(mentions, " ") + "\nТег упомянут!")
 		}
 		return nil
 	})
